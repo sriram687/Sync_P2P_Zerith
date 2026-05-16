@@ -5,9 +5,15 @@ import { useZerith as useZerithInternal } from 'zerithdb-react';
 import { EventEmitter } from 'zerithdb-core';
 
 /**
- * A shared event emitter to notify hooks of local database changes.
+ * A shared event emitter to notify hooks of local database changes within the same tab.
  */
 const localDbEvents = new EventEmitter<{ 'change': null }>();
+
+/**
+ * A BroadcastChannel to notify hooks in other tabs of database changes.
+ * This is essential because IndexedDB changes don't automatically trigger UI refreshes in other tabs.
+ */
+const crossTabSync = typeof window !== 'undefined' ? new BroadcastChannel('zerith_p2p_sync') : null;
 
 /**
  * Access the underlying ZerithDB client.
@@ -71,8 +77,10 @@ export function useQuery<T = any>(collectionName: string) {
   const fetchDocs = useCallback(async () => {
     try {
       const docs = await collection.find({});
-      // Sort by timestamp if available to keep a stable UI
+      // Sort by timestamp
       setData(docs.sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0)));
+    } catch (err) {
+      console.error("Failed to fetch docs:", err);
     } finally {
       setLoading(false);
     }
@@ -83,12 +91,28 @@ export function useQuery<T = any>(collectionName: string) {
 
     const refresh = () => fetchDocs();
     
-    // Listen to remote P2P updates
+    // Listen to remote P2P updates (if signaling server is up)
     app.sync.on('update:remote' as any, refresh);
     app.sync.on('update:local' as any, refresh);
     
-    // Listen to local mutations from other hooks
+    // Listen to local mutations in the CURRENT tab
     localDbEvents.on('change', refresh);
+
+    // Listen to local mutations in OTHER tabs
+    if (crossTabSync) {
+      const handleMessage = (event: MessageEvent) => {
+        if (event.data === 'db:change') {
+          refresh();
+        }
+      };
+      crossTabSync.addEventListener('message', handleMessage);
+      return () => {
+        app.sync.off('update:remote' as any, refresh);
+        app.sync.off('update:local' as any, refresh);
+        localDbEvents.off('change', refresh);
+        crossTabSync.removeEventListener('message', handleMessage);
+      };
+    }
 
     return () => {
       app.sync.off('update:remote' as any, refresh);
@@ -97,21 +121,28 @@ export function useQuery<T = any>(collectionName: string) {
     };
   }, [app, fetchDocs]);
 
+  const notifyChange = () => {
+    // Notify this tab
+    localDbEvents.emit('change', null);
+    // Notify other tabs
+    crossTabSync?.postMessage('db:change');
+  };
+
   const insert = async (doc: any) => {
     const res = await collection.insert(doc);
-    localDbEvents.emit('change', null);
+    notifyChange();
     return res;
   };
 
   const remove = async (id: string) => {
     const res = await collection.delete({ _id: id } as any);
-    localDbEvents.emit('change', null);
+    notifyChange();
     return res;
   };
 
   const update = async (id: string, updates: any) => {
     const res = await collection.update({ _id: id } as any, { $set: updates });
-    localDbEvents.emit('change', null);
+    notifyChange();
     return res;
   };
 
